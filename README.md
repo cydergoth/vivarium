@@ -6,6 +6,9 @@ Expandable Vivarium Controller (Arduino)
 This project is the driver software for an expandable Vivarium temperature controller using an Arduino as the 
 system master controller.
 
+Features
+--------
+
 This controller has a number of software features
 * Menu driven via 12 digit telephone keypad
 * Scrolling LCD temperature display
@@ -19,7 +22,10 @@ This controller has a number of software features
 * Configurable F/C display
 * Backlight Off "Sleep" mode for LCD, press and hold '*' to wakeup
 
-The following other components are required (URLs are provided for example only):
+Required Hardware
+-----------------
+
+In addition to an Arduino the following other components are required (URLs are provided for example only):
 * I2C based LCD controller with Telephone Keypad capability
   http://www.robot-electronics.co.uk/htm/Lcd03tech.htm
 * DS18S/B20 temperature sensors x 1 - 8
@@ -38,6 +44,8 @@ Miscellaneous hardware, resistors, sockets, plugs etc
 Note: When using low voltage (<110v) controlled 100v relays, always observe mains level precautions and ensure
 isolation between the low voltage and high voltage sides. Use a non-conductive filler compound, resin, or a non-condudting shield between the two voltage zones
 
+Required Libraries
+------------------
 In addition to the software in this repository a number of external libraries are needed
 
 * 1-Wire library
@@ -50,10 +58,11 @@ In addition to the software in this repository a number of external libraries ar
 * Fat16 library
   https://code.google.com/p/fat16lib/
 
-Pin definitions:
+Pin definitions
+---------------
 
-I2C - Display and keypad, Optional DS1307RTC Real Time Clock
-Pin #2 (Digital) - Dallas 1-Wire for the temperature sensors. These are all daisy chained on this one pin.
-Pin #3 (Digital) - Relay #1. Additional relays may be added as required
-Pin #8 (PCM) - Sounder for alarm 
+* I2C - Display and keypad, Optional DS1307RTC Real Time Clock
+* Pin #2 (Digital) - Dallas 1-Wire for the temperature sensors. These are all daisy chained on this one pin.
+* Pin #3 (Digital) - Relay #1. Additional relays may be added as required
+* Pin #8 (PCM) - Sounder for alarm 
 
