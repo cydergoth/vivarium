@@ -4,6 +4,7 @@
 #include "lcd.h"
 #include "vivtime.h"
 
+#ifdef LOCAL_DISPLAY
 void fmtTime(char *buf) {
   fmtTime(buf,now());
 }
@@ -109,3 +110,5 @@ bool parseDateTime(char *buf,bool set) {
     }
 
 }
+
+#endif

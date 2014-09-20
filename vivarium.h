@@ -1,3 +1,8 @@
+#ifdef YUN
+#define BRIDGE
+#undef LOCAL_DISPLAY
+#endif
+
 struct hilo {
   byte lo;
   byte hi;
@@ -23,6 +28,8 @@ struct herp_header {
   struct viv vivs[8];
 };
 
+#ifdef LOCAL_DISPLAY
+
 enum menu_state_t {
   no_menu,
   main_menu,
@@ -37,6 +44,8 @@ enum menu_state_t {
   pin_edit,
   edit_name
 };
+
+#endif
 
 #define RADIX_HEX 16
 #define RADIX_DEC 10

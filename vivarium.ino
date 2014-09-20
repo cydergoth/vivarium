@@ -16,29 +16,21 @@
 #endif
 #include "pitches.h"p
 #include <avr/wdt.h>
-#undef BRIDGE
 #ifdef BRIDGE
 #include <String.h>
 #include <Mailbox.h>
 #endif
 
+#ifdef LOCAL_DISPLAY
+
 // General purpose input buffer
 char inputBuf[16];
-
-// General purpose display buffer
-char displayBuf[17];
 
 // Cursor into intput buffer
 int cursor=-1;
 
 // Index of currently selected viv for UI menus
 int vivIndex=0;
-
-// Total number of discovered connected sensors
-int sensorCount=-1;
-
-// Time the last sensor read attempt was made
-time_t lastRead=0;
 
 // Currently active key or 0 if none
 char key;
@@ -55,24 +47,43 @@ bool sameKey=false;
 // Is the backlight on/
 bool backlight=true;
 
+// Index into the spinner character array
+byte spinner=0;
+
+menu_state_t menuState=no_menu;
+
+#endif
+
+// General purpose display buffer
+char displayBuf[17];
+
+// Total number of discovered connected sensors
+int sensorCount=-1;
+
+// Time the last sensor read attempt was made
+time_t lastRead=0;
+
 // Did reading the EEPROM cause a reset?
 bool didReset=false;
+
+#ifdef LOGGER
 
 // Is an SD Card present
 bool sdPresent=false;
 
+#endif
+
 // Time of the boot or when the clock was set
 time_t boot;
 
-byte spinner=0;
-
 boolean silence=false;
 
-menu_state_t menuState=no_menu;
 struct herp_header herp;
 
 void dot() {
+#ifdef LOCAL_DISPLAY
     write_P(PSTR("."));
+#endif  
 }
 
 void setup() {
@@ -80,19 +91,25 @@ void setup() {
     Bridge.begin();
     Mailbox.begin();
 #endif
+
     Wire.begin();    
+
+#ifdef LOCAL_DISPLAY    
     cmd(LCD_CMD_BACKLIGHT_ON);
     cls();
     cursorOff();
     dot();
+#endif
 
     readEeprom();
     dot();
 
     memset(&sensors,0,sizeof(sensors));
+#ifdef LOCAL_DISPLAY    
     memset(&scrollWindow,0,sizeof(scrollWindow));
     scrollWindow.line=0;
     dot();
+#endif
 
 #ifdef SERIAL
     Serial.begin(9600);
@@ -106,7 +123,7 @@ void setup() {
             pinMode(pin,OUTPUT);
         }
     }
-    pinMode(SOUNDER_PIN,OUTPUT);
+    pinMode(SOUNDER_PIN,OUTPUT);    
     dot();
 
 #ifdef LOGGER
@@ -117,13 +134,18 @@ void setup() {
     sensorCount=scanbus();
     dot();
 
+#ifdef LOCAL_DISPLAY
     noMenu();
+#endif
 
 #ifdef SERIAL
     Serial.println(F("H"));
+#else 
+    Mailbox.writeMessage("H");
 #endif
 }
 
+#ifdef LOCAL_DISPLAY
 void writeTemp(float temp) {
     dtostrf(temp,3,1,displayBuf);
     displayBuf[5]=0;
@@ -219,6 +241,8 @@ void normalDisplay() {
 
 }
 
+#endif
+
 float cToMaybeF(float temperature) {
     if(herp.flags & (1<<TEMP_FLAG)) {
         return (temperature*9.0)/5.0+32;
@@ -236,6 +260,8 @@ float maybeFToC(float temperature) {
         return temperature;
     }
 }
+
+#ifdef LOCAL_DISPLAY
 
 void displayTemp(int i) {
     if(!sensors[i].valid) {
@@ -520,6 +546,8 @@ void timeEntry() {
     cursor=0;
 }
 
+#endif
+
 void setLo(int v,float lo) {
     if(lo>getTarget(v)) lo=getTarget(v);
     herp.vivs[v].temp.lo=(byte)((herp.vivs[v].temp.target-lo)*10);
@@ -563,6 +591,8 @@ int sensorForViv(int v) {
     }
     return -1;
 }
+
+#ifdef LOCAL_DISPLAY
 
 void displayViv(int v) {
     vivHeader(v);
@@ -681,12 +711,17 @@ void assignVivSensor() {
     showBack();
 }
 
+#endif
+
 void updateEeprom() {
+#ifdef LOCAL_DISPLAY  
     cls();
     writeAt_P(6,2,PSTR("Saving..."));
+#endif
     writeEeprom();
 }
 
+#ifdef LOCAL_DISPLAY
 void addViv() {
     scrollWindow.line=0;
     // Fixme: viv index naming on add after delete
@@ -723,7 +758,7 @@ void pinEdit() {
     cursor=0;
     showBack();
 }
-
+#endif
 #ifdef SERIAL
 void dumpSensorsToSerial() {
     for(int i=0;i<sensorCount;i++) {
@@ -744,6 +779,7 @@ void dumpSensorsToSerial() {
 #ifdef BRIDGE
 
 void dumpSensorsToBridge() {
+    Mailbox.writeMessage("S");
     for(int i=0;i<sensorCount;i++) {
         String sensor;
         sensor+=(i);
@@ -757,7 +793,7 @@ void dumpSensorsToBridge() {
         sensor+=sensors[i].relay_on;
         Mailbox.writeMessage(sensor);
     }
-
+    Mailbox.writeMessage("Z");
 }
 
 void handleMessage() {
@@ -779,6 +815,11 @@ void handleMessage() {
             Serial.println(displayBuf);
         }
 #endif
+        // Set vivarium name
+        if(cmd=='N') {
+           int vivIndex=(msg[1]-'0')*10+(msg[2]-'0');
+           strncpy(herp.vivs[vivIndex].name,buf,8);
+        }
         // REBOOT!
         if(cmd=='R') {
             wdt_enable (WDTO_2S);  // reset after two second, if no "pat the dog" received
@@ -793,10 +834,13 @@ void loop() {
 
     if(current-lastRead>10) {
         readSensors();
+#ifdef LOCAL_DISPLAY        
         if(menuState==no_menu) sensorSpinner();
+#endif        
         lastRead=current;
     }
 
+#ifdef LOCAL_DISPLAY
     key=readKey();
     sameKey=key==lastKey;
     lastKey=key;
@@ -983,6 +1027,7 @@ void loop() {
             break;
         }
     }
+#endif
 
 #ifdef BRIDGE
     if(Mailbox.messageAvailable()) {
@@ -990,6 +1035,7 @@ void loop() {
     }
 #endif
 
+#ifdef LOCAL_DISPLAY
     display();
 
     if(menuState!=set_time && backlight && (current - lastKeyTime ) > 5*60) {
@@ -1001,6 +1047,9 @@ void loop() {
     // Change response time if backlight is on
     if(!backlight) delay(500);
     else delay(50);
+#else
+   delay(500);
+#endif
 
 }
 
