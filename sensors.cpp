@@ -155,7 +155,9 @@ void readSensors() {
         noTone(SOUNDER_PIN);
       }
     }
+#ifdef LOGGER    
     logData(i,v,target);
+#endif
   }
 }
 

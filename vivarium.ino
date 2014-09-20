@@ -1,16 +1,26 @@
+
 #include <Wire.h>
 #include <OneWire.h>
 #include <Time.h>
 #include <EEPROM.h>
 #include <avr/pgmspace.h>
+#ifdef LOGGER
 #include <Fat16.h>
+#endif
 #include "vivarium.h"
 #include "lcd.h"
 #include "vivtime.h"
 #include "settings.h"
+#ifdef LOGGER
 #include "filestore.h"
+#endif
 #include "pitches.h"p
 #include <avr/wdt.h>
+#undef BRIDGE
+#ifdef BRIDGE
+#include <String.h>
+#include <Mailbox.h>
+#endif
 
 // General purpose input buffer
 char inputBuf[16];
@@ -66,7 +76,11 @@ void dot() {
 }
 
 void setup() {
-    Wire.begin();
+#ifdef BRIDGE
+    Bridge.begin();
+    Mailbox.begin();
+#endif
+    Wire.begin();    
     cmd(LCD_CMD_BACKLIGHT_ON);
     cls();
     cursorOff();
@@ -80,8 +94,10 @@ void setup() {
     scrollWindow.line=0;
     dot();
 
+#ifdef SERIAL
     Serial.begin(9600);
     dot();
+#endif
 
     // Init relays
     for(int i=0;i<herp.viv_count;i++) {
@@ -93,15 +109,19 @@ void setup() {
     pinMode(SOUNDER_PIN,OUTPUT);
     dot();
 
+#ifdef LOGGER
     initSD();
     dot();
+#endif
 
     sensorCount=scanbus();
     dot();
 
     noMenu();
 
+#ifdef SERIAL
     Serial.println(F("H"));
+#endif
 }
 
 void writeTemp(float temp) {
@@ -704,6 +724,7 @@ void pinEdit() {
     showBack();
 }
 
+#ifdef SERIAL
 void dumpSensorsToSerial() {
     for(int i=0;i<sensorCount;i++) {
         Serial.print(i);
@@ -718,6 +739,54 @@ void dumpSensorsToSerial() {
     }
     Serial.flush();
 }
+#endif
+
+#ifdef BRIDGE
+
+void dumpSensorsToBridge() {
+    for(int i=0;i<sensorCount;i++) {
+        String sensor;
+        sensor+=(i);
+        sensor+=(',');
+        sensorIdToBuffer(i,displayBuf);
+        displayBuf[16]=0;
+        sensor+=displayBuf;
+        sensor+=',';
+        sensor+=sensors[i].value;
+        sensor+=',';
+        sensor+=sensors[i].relay_on;
+        Mailbox.writeMessage(sensor);
+    }
+
+}
+
+void handleMessage() {
+     String msg;
+     Mailbox.readMessage(msg);
+     char cmd=msg[0];
+     if(cmd=='S') dumpSensorsToBridge();
+#ifdef NOT_YET          
+        // Set time
+        if(cmd=='t') {
+            Serial.readBytes(inputBuf,14);
+            inputBuf[14]=0;
+            parseDateTime(inputBuf,true);
+        }
+        // Clock
+        if(cmd=='C') {
+            fmtDateTime(displayBuf,now());
+            displayBuf[14]=0;
+            Serial.println(displayBuf);
+        }
+#endif
+        // REBOOT!
+        if(cmd=='R') {
+            wdt_enable (WDTO_2S);  // reset after two second, if no "pat the dog" received
+            while(true);
+        }
+}
+
+#endif
 
 void loop() {
     time_t current=now();
@@ -915,6 +984,12 @@ void loop() {
         }
     }
 
+#ifdef BRIDGE
+    if(Mailbox.messageAvailable()) {
+      handleMessage();
+    }
+#endif
+
     display();
 
     if(menuState!=set_time && backlight && (current - lastKeyTime ) > 5*60) {
@@ -929,10 +1004,12 @@ void loop() {
 
 }
 
+#ifdef SERIAL
 void serialEvent() {
     while(Serial.available()) {
         int cmd=Serial.read();
         if(cmd=='S') dumpSensorsToSerial();
+#ifdef LOGGER        
         // List files human readable
         if(cmd=='L') Fat16::ls(LS_DATE | LS_SIZE);
         // list files just names
@@ -947,6 +1024,7 @@ void serialEvent() {
             int fileIdx=Serial.read()-'0';
             truncateFile(fileIdx);
         }
+#endif       
         // Set time
         if(cmd=='t') {
             Serial.readBytes(inputBuf,14);
@@ -972,4 +1050,5 @@ void serialEvent() {
             while(true);
         }
     }
+#endif
 }

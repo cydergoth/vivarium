@@ -1,3 +1,5 @@
+#ifdef LOGGER
+
 #include <Arduino.h>
 #include <Fat16.h>
 #include <Time.h>
@@ -78,3 +80,5 @@ void logData(int idx,int viv,float target) {
   file.sync();
   file.close();
 }
+
+#endif
