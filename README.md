@@ -57,3 +57,5 @@ Top left is the Yun with a shield mounting the resistor for the 1-wire bus and s
 On the side of the case above it is an Ethernet jack and an RJ25 for the 1-wire bus (I use RJ11/25 for all the sensors)
 
 The relay board is visible on the left and the remaining space is where the 110v connector wires were fitted to the busbars
+
+![Controller Image](controller.jpg)
