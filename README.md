@@ -15,6 +15,12 @@ This controller has a number of software features
 * Can log data via collectd on the OpenWRT side of the Yun
 * REST api to set and retrieve temperature control settings and current sensor values
 
+Image of Graphite Charts
+------------------------
+This system logs data using collectd to a collectd hub server running graphite
+
+![Graph Image] (graphite.png)
+
 Required Hardware
 -----------------
 
