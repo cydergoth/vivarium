@@ -2,7 +2,7 @@
 #include <EEPROM.h>
 #include <Time.h>
 #define REQUIRESALARMS 0
-#define REQUIRESNEW 1
+#define REQUIRESNEW 0
 #include <DallasTemperature.h>
 
 struct hilo {
