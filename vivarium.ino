@@ -1,1103 +1,587 @@
+/*
+  Vivarium Environment Controller based on
+  Arduino Yún Bridge example ( http://arduino.cc/en/Tutorial/Bridge )
 
-#include <Wire.h>
+  LGPL V3
+ */
+#include <Bridge.h>
+#include <YunServer.h>
+#include <YunClient.h>
 #include <OneWire.h>
 #include <Time.h>
+#include <TimeAlarms.h>
 #include <EEPROM.h>
-#include <avr/pgmspace.h>
-#ifdef LOGGER
-#include <Fat16.h>
-#endif
-#include "vivarium.h"
-#include "lcd.h"
-#include "vivtime.h"
+
+// Settings for DallasTemperature library
+#define REQUIRESALARMS 0
+#define REQUIRESNEW 0
+#include <DallasTemperature.h>
+
+#include "controller.h"
 #include "settings.h"
-#ifdef LOGGER
-#include "filestore.h"
-#endif
-#include "pitches.h"p
-#include <avr/wdt.h>
-#ifdef BRIDGE
-#include <String.h>
-#include <Mailbox.h>
-#endif
+#define ONE_WIRE_BUS 3 // FIXME! Shared with I2C due to me reading the diagram incorrectly. Should move to one of pin 14-19
+#define LED 13
+#define SKT_BASE 5
+#include <Process.h>
 
-#ifdef LOCAL_DISPLAY
+// FIXME: Eliminate use of "String" in all included libraries and replace with fixed or stack allocation
 
-// General purpose input buffer
-char inputBuf[16];
+// Relay power constants
+#define POWER_ON 0
+#define POWER_OFF 1
 
-// Cursor into intput buffer
-int cursor=-1;
+#define HI_THRESHOLD 0.25f
+#define LO_THRESHOLD 0.25f
 
-// Index of currently selected viv for UI menus
-int vivIndex=0;
+// Listen on default port 5555, the webserver on the Yún
+// will forward there all the HTTP requests for us.
+YunServer server;
 
-// Currently active key or 0 if none
-char key;
+// Low level support for the Dallas Semiconductor 1-Wire bus
+OneWire ds(ONE_WIRE_BUS);
 
-// Last active key
-char lastKey=0;
+// High level support for the DS18B20 sensors
+DallasTemperature sensors(&ds);
 
-// Time of the last recognised keypress
-time_t lastKeyTime=0;
+#define MAX_DS1820_SENSORS 8
+// Set of discovered sensors
+DeviceAddress addr[MAX_DS1820_SENSORS];
+unsigned short valid = 0; // Max of 16 sensors
 
-// Is the currently pressed key the same as the previously polled key
-bool sameKey=false;
+system_flags sys_state;
 
-// Is the backlight on/
-bool backlight=true;
-
-// Index into the spinner character array
-byte spinner=0;
-
-menu_state_t menuState=no_menu;
-
-#endif
-
-// General purpose display buffer
-char displayBuf[17];
-
-// Total number of discovered connected sensors
-int sensorCount=-1;
-
-// Time the last sensor read attempt was made
-time_t lastRead=0;
-
-// Did reading the EEPROM cause a reset?
-bool didReset=false;
-
-#ifdef LOGGER
-
-// Is an SD Card present
-bool sdPresent=false;
-
-#endif
-
-// Time of the boot or when the clock was set
-time_t boot;
-
-boolean silence=false;
-
+// Copy of the configuration loaded from eeprom on boot
 struct herp_header herp;
 
-void dot() {
-#ifdef LOCAL_DISPLAY
-    write_P(PSTR("."));
-#endif  
+// Write a completion message to a REST client
+inline void send_ok(YunClient &client) {
+  client.println(F("OK"));
+  return;
+}
+
+// Scan the one wire bus and update the list of valid sensors
+// TODO: Report on missing sensors 
+int scan() {
+  ds.reset_search();
+  memset(addr, 0, sizeof(addr));
+  valid = 0;
+  int i = 0;
+  do {
+    if (!ds.search(addr[i])) {
+      // No more sensors
+      break;
+    }
+    if (OneWire::crc8(addr[i], 7) != addr[i][7]) {
+      // Sensor checksum bad
+      continue;
+    }
+    if (addr[i][0] != 0x28) {
+      // Not a DS18B20
+      continue;
+    }
+    valid |= (1 << i);
+    i++;
+  } while (true);
+
+  if (!valid) {
+    // No sensors found, turn off das blinkenlicht
+    digitalWrite(LED, LOW);
+  }
+  return i;
+}
+
+// Set all the socket pins controlled by the timer to 'state'
+void timerSet(int idx, int state) {
+  for (int i = 0; i < MAX_POWER_SKT; i++) {
+    if (herp.power[i].ctrl_type == CTRL_TIMER && herp.power[i].controller.timer_idx == idx) digitalWrite(SKT_BASE + i, state);
+  }
+}
+
+// Set all timer controlled sockets to ON
+inline void timerOn(int idx) {
+  timerSet(idx, POWER_ON);
+}
+
+// Set all timer controlled sockets to OFF
+inline void timerOff(int idx) {
+  timerSet(idx, POWER_OFF);
+}
+
+// Write an error message and abort if the next character in the REST request is not a '/'
+// TODO: Investigate longjump here
+bool checkSlash(YunClient &client) {
+  if (client.read() != '/') {
+    client.println('/');
+    return false;
+  }
+  return true;
+}
+
+#define MAX(a,b) ((a)>(b))?(a):(b)
+
+#ifdef USE_NAMES
+// Format n/<skt>/<new name>
+inline void nameCommand(YunClient &client) {
+  if (!checkSlash(client)) return;
+  int skt = client.parseInt();
+  if (!checkSlash(client)) return;
+  client.read(); // Bug workaround
+  char *ptr = herp.power[skt].name;
+  for (int i = 0; i < NAME_LENGTH - 1; i++) {
+    char c = client.read();
+    if (isspace(c)) break;
+    if (c == '+') c = ' '; // Simple URL decode of space
+    *ptr++ = c;
+  }
+  *ptr = 0; // Ensure null terminate short names
+  writeEeprom();
+  send_ok(client);
+  return;
+}
+#endif
+
+inline void bindSensor(YunClient &client, int skt) {
+  if (!checkSlash(client)) return;
+  int sensorIdx = client.parseInt(); // FIXME: possible race condition here if sensor order has changed
+  if (!(valid & 1 << sensorIdx)) {
+    client.println('X');
+    return;
+  }
+  sensors.getAddress(herp.power[skt].controller.sensor.addr, sensorIdx);
+  if (!checkSlash(client)) return;
+  setTarget(skt, client.parseFloat());
+  if (client.read() != ',') {
+    client.println(',');
+    return;
+  }
+  setLo(skt, client.parseFloat());
+  if (client.read() != ',') {
+    client.println(',');
+    return;
+  }
+  setHi(skt, client.parseFloat());
+  writeEeprom();
+  send_ok(client);
+  return;
+}
+
+// Bind a sensor or timer to a socket. This is the master configuration command
+// Format: b/<skt>/0 - Always off
+//         b/<skt>/1/<sensor idx>/<target temp in C>,<lo offset>*10,<hi offset>*10 - Sensor controlled
+//         b/<skt>/2/<timer idx> - Timer Controller
+//         b/<skt>/3/[01] - Short manual override
+//         b/<skt>/4 - Always on
+inline void bindCommand(YunClient &client) {
+  if (!checkSlash(client)) return;
+  int skt = client.parseInt();
+  if (skt < 0 || skt >= MAX_POWER_SKT) {
+    client.println('S');
+    return;
+  }
+  if (!checkSlash(client)) return;
+  int mode = client.parseInt();
+  // Simple range check on mode
+  if (mode > CTRL_MAX || mode < CTRL_NONE) {
+    client.println('M');
+    return;
+  }
+  if (mode != CTRL_MANUAL) herp.power[skt].ctrl_type = mode;
+  switch (mode) {
+    case CTRL_NONE: {
+        digitalWrite(SKT_BASE + skt, POWER_OFF);
+        memset(herp.power[skt].controller.sensor.addr, 0, sizeof(DeviceAddress));
+        writeEeprom();
+        send_ok(client);
+        return;
+      }
+    case CTRL_ALWAYS_ON: {
+        digitalWrite(SKT_BASE + skt, POWER_ON);
+        memset(herp.power[skt].controller.sensor.addr, 0, sizeof(DeviceAddress));
+        writeEeprom();
+        send_ok(client);
+        return;
+      }
+    case CTRL_SENSOR: {
+        bindSensor(client, skt);
+        return;
+      }
+    case CTRL_TIMER: {
+        if (!checkSlash(client)) return;
+        memset(herp.power[skt].controller.sensor.addr, 0, sizeof(DeviceAddress));
+        herp.power[skt].controller.timer_idx = client.parseInt();
+        writeEeprom();
+        resetTimers();
+        send_ok(client);
+        return;
+      }
+    case CTRL_MANUAL: {
+        if (!checkSlash(client)) return;
+        int val = client.parseInt();
+        digitalWrite(SKT_BASE + skt, val ? POWER_OFF : POWER_ON);
+        // No store to eeprom, temporary manual override
+        // Use CTRL_NONE or CTRL_ALWAYS_ON for permenant state
+        send_ok(client);
+        return;
+      }
+  }
+  client.println(F("?"));
+}
+
+// Invoke 'date +%s' on the Linux side to get the seconds from epoch
+time_t timeSync() {
+  Process date;
+  date.begin("date");
+  date.addParameter("+%s"); // Time in seconds from epoch
+  date.run();
+  time_t time = 0;
+  if (date.available() > 0) {
+    // get the result of the date process (should be hh:mm:ss):
+    String timeString = date.readString();
+    time = (time_t)timeString.toInt(); // FIXME: Need a proper conversion function which can parse and return time_t
+  }
+  return time;
+}
+
+// Curried timer functions as timer alarm library doesn't permit passing data
+void timerOn0() {
+  timerOn(0);
+}
+void timerOn1() {
+  timerOn(1);
+}
+typedef void (*TimerPtr)();
+TimerPtr timerOnA[] = { timerOn0, timerOn1 };
+void timerOff0() {
+  timerOff(0);
+}
+void timerOff1() {
+  timerOff(1);
+}
+TimerPtr timerOffA[] = { timerOff0, timerOff1 };
+
+void resetTimers() {
+  for (uint8_t id = 0; id < dtNBR_ALARMS; id++) {
+    Alarm.free(id);
+  }
+
+  for (int i = 0; i < TIMER_MAX; i++) {
+    if (herp.timer[i].on_hour != 0 || herp.timer[i].on_min != 0) {
+      Alarm.alarmRepeat(herp.timer[i].on_hour, herp.timer[i].on_min, 0, timerOnA[i]);
+      Alarm.alarmRepeat(herp.timer[i].off_hour, herp.timer[i].off_min, 0, timerOffA[i]);
+    }
+  }
 }
 
 void setup() {
-#ifdef BRIDGE
-    Bridge.begin();
-    Mailbox.begin();
-#endif
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
 
-    Wire.begin();    
+  readEeprom();
 
-#ifdef LOCAL_DISPLAY    
-    cmd(LCD_CMD_BACKLIGHT_ON);
-    cls();
-    cursorOff();
-    dot();
-#endif
-
-    readEeprom();
-    dot();
-
-    memset(&sensors,0,sizeof(sensors));
-#ifdef LOCAL_DISPLAY    
-    memset(&scrollWindow,0,sizeof(scrollWindow));
-    scrollWindow.line=0;
-    dot();
-#endif
-
-#ifdef SERIAL
-    Serial.begin(9600);
-    dot();
-#endif
-
-    // Init relays
-    for(int i=0;i<herp.viv_count;i++) {
-        byte pin=herp.vivs[i].relay_pin;
-        if(pin>0) {
-            pinMode(pin,OUTPUT);
-        }
-    }
-    pinMode(SOUNDER_PIN,OUTPUT);    
-    dot();
-
-#ifdef LOGGER
-    initSD();
-    dot();
-#endif
-
-    sensorCount=scanbus();
-    dot();
-
-#ifdef LOCAL_DISPLAY
-    noMenu();
-#endif
-
-#ifdef SERIAL
-    Serial.println(F("H"));
-#else 
-    Mailbox.writeMessage("H");
-#endif
-}
-
-#ifdef LOCAL_DISPLAY
-void writeTemp(float temp) {
-    dtostrf(temp,3,1,displayBuf);
-    displayBuf[5]=0;
-    write(displayBuf);
-}
-
-void sensorSpinner() {
-    at(20,3);
-    Wire.beginTransmission(I2C_LCD_ADDR);
-    Wire.write(LCD_REG_CMD);
-    Wire.write("|/-\\"[spinner]);
-    Wire.endTransmission();
-    spinner++;
-    if(spinner==4) spinner=0;
-}
-
-void mainMenu() {
-    menuState=main_menu;
-    cls();
-    writeAt_P(1 ,1,PSTR("MENU"));
-    writeAt_P(1 ,2,PSTR("1 Time"));
-    writeAt_P(1 ,3,PSTR("2 Setup"));
-    writeAt_P(10,2,PSTR("3 Vivs"));
-    showBack();
-}
-
-
-void display() {
-
-    switch(menuState) {
-    case set_time:
-    case set_temp:
-    case setup_menu:
-    case viv_menu:
-    case pin_edit:
-        break;
-    case assign:
-        {
-            if(displaySwitch>0) {
-                break;
-            }
-            scrollSensors();
-        }
-        break;
-    case no_menu:
-        timeAt(13,1);
-        normalDisplay();
-        break;
-        //case main_menu: mainMenu(); break;
-    }
-    if(scrollWindow.line!=0) scroll();
-    displaySwitch--;
-    if(displaySwitch<0) displaySwitch=6;
-}
-
-void timeAt(int x,int y) {
-    switch(timeStatus()) {
-    case timeNotSet:
-        writeAt_P(x,y,PSTR("TIME"));
-        break;
-    case timeSet:
-        fmtTime(displayBuf);
-        displayBuf[8]=0;
-        writeAt(x,y,displayBuf);
-        break;
-    case timeNeedsSync:
-        writeAt_P(x,y,PSTR("SYNC"));
-        break;
-    }
-}
-
-int mainDispBase=0;
-void normalDisplay() {
-    at(1,2);
-
-    for(int i=0;i<2;i++) {
-        if(mainDispBase+i<sensorCount) {
-            displayTemp(mainDispBase+i);
-        }
-        if(displaySwitch==0) {
-            mainDispBase++;
-            if(mainDispBase>=sensorCount) mainDispBase=0;
-        }
-    }
-
-    // Display keys for debugging
-    //char buf[2];
-    //buf[0]=key>0?key:' ';
-    //buf[1]=0;
-    //writeAt(19,2,buf);
-    //buf[0]=lastKey;
-    //writeAt(19,3,buf);
-
-}
-
-#endif
-
-float cToMaybeF(float temperature) {
-    if(herp.flags & (1<<TEMP_FLAG)) {
-        return (temperature*9.0)/5.0+32;
-    }
-    else {
-        return temperature;
-    }
-}
-
-float maybeFToC(float temperature) {
-    if(herp.flags & (1<<TEMP_FLAG)) {
-        return ((temperature-32.0)*5.0)/9.0;
-    }
-    else {
-        return temperature;
-    }
-}
-
-#ifdef LOCAL_DISPLAY
-
-void displayTemp(int i) {
-    if(!sensors[i].valid) {
-        write_P(PSTR("ERR"));
-        cmd(LCD_CMD_CR);
-        return;
-    }
-    if(! sensors[i].relay_on) {
-        write_P(PSTR("  "));
-    }
-    else {
-        write_P(PSTR("! "));
-    }
-    float temperature=sensors[i].value;
-    float temp=cToMaybeF(temperature);
-    writeTemp(temp);
-    write_P(PSTR(" "));
-    int v=vivForSensor(i);
-    if(v>-1) {
-        strncpy(displayBuf,herp.vivs[v].name,8);
-        displayBuf[8]=0;
-        write(displayBuf);
-    }
-    cmd(LCD_CMD_CR);
-}
-
-// If a temperature is being edited, this is it
-// It is in the display units
-float editingTemp;
-enum edit_temp_type temp_type;
-
-int digitCursor=0;
-
-void displayAlphaNum() {
-  at(1,2);
-  for(int i=0;i<20;i++) {
-    cmd((byte)('A'+i));
+  // Ensure all sockets start off powered down unless specifically set to CTRL_ALWAYS_ON
+  for (int i = 0; i < MAX_POWER_SKT; i++) {
+    if (herp.power[i].ctrl_type == CTRL_ALWAYS_ON) digitalWrite(SKT_BASE + i, POWER_ON);
+    else digitalWrite(SKT_BASE + i, POWER_OFF);
+    pinMode(SKT_BASE + i, OUTPUT);
   }
-  at(1,3);
-  for(int i=20;i<26;i++) {
-    cmd((byte)('A'+i));
-  }
-  cmd('s');
-  at(1,4);
-  for(int i=0;i<10;i++) {
-    cmd((byte)('0'+i));
-  }  
+
+
+  // Bridge startup
+  Bridge.begin();
+
+  // Initialize clock
+  setTime(timeSync());
+  // Setup to sync time every 12 hours
+  setSyncInterval(60 * 60 * 12);
+  setSyncProvider(timeSync);
+  sys_state.bootTime = now();
+
+  // Ensure any configured timers are running
+  resetTimers();
+
+  // Listen for incoming connection only from localhost
+  // (no one from the external network could connect)
+  server.listenOnLocalhost();
+  server.begin();
+
+  // Start the 1-Wire bus and configure the DS18B20 sensors
+  sensors.begin();
+  sensors.setResolution(TEMP_12_BIT);
+  digitalWrite(LED, HIGH);
+  scan();
+
 }
 
-void editName() {
-  menuState=edit_name;
-  cls();
-
-  vivHeader(vivIndex);
-  memset(inputBuf,0,9);  
-  displayAlphaNum();
-  cursor=0;
-  setChar(0);
-  at(1,2);
-  cursorOn();
+void setLo(int v, float lo) {
+  if (lo > getTarget(v)) lo = getTarget(v);
+  herp.power[v].controller.sensor.temp.lo = (byte)((herp.power[v].controller.sensor.temp.target - lo) * 10);
 }
 
-void showDigitCursor() { 
-  if(digitCursor<27) {
-  int col=digitCursor % 20;
-  int line=digitCursor / 20;
-  at(col+1,line+2);
-  } else {
-    at(1+digitCursor-27,4);
-  }
-}
-
-void setChar(char code) {
-  inputBuf[cursor++]=code;
-  if(code==0) cursor=0;
-  if(cursor>7) cursor=7;
-  writeAt(6,1,inputBuf);
-  int len=strlen(inputBuf);
-  for(int i=len;i<8;i++) cmd('.');
-  showDigitCursor();
-}
-
-void setName(char *buf) {
-  strncpy(herp.vivs[vivIndex].name,buf,8);
-}
-
-void handleNameKey(char key) {
-  switch(key) {
-    case '*':  
-        setName(inputBuf);
-        cursorOff();
-        updateEeprom();
-        vivEditMenu();
-        return;
-   case '#': {
-     inputBuf[cursor]=0;
-     cursor--;
-     if(cursor<0) cursor=0;
-     break;
-   }
-   case '5': {
-     if(digitCursor<26) {
-       setChar((char)('A'+digitCursor));
-       return;
-     }  
-     if(digitCursor==26) { setChar(' '); return; }
-     if(digitCursor>26) { setChar((char)('0'+digitCursor-27)); return; }
-   }
-   case '6': { digitCursor++; if(digitCursor>36) digitCursor=0; showDigitCursor(); break;}
-   case '4': { digitCursor--; if(digitCursor<0) digitCursor=36; showDigitCursor(); break; }
-}
-}
-
-void editTemp(char key) {
-    float lo=0;
-    float hi=0;
-    switch(key) {
-    case '*':
-        editingTemp=maybeFToC(parseTemp(inputBuf));
-        switch(temp_type) {
-        case edit_target:
-            {
-                lo=getLo(vivIndex);
-                hi=getHi(vivIndex);
-                setTarget(vivIndex,editingTemp);
-                setLo(vivIndex,lo);
-                setHi(vivIndex,hi);
-                break;
-            }
-        case edit_lo:
-            {
-                setLo(vivIndex,editingTemp);
-                break;
-            }
-        case edit_hi:
-            {
-                setHi(vivIndex,editingTemp);
-                break;
-            }
-        }
-        cursorOff();
-        updateEeprom();
-        vivEditMenu();
-        return;
-    case '#':
-        {
-            cursor--;
-            if(cursor<0) cursor=0;
-            if(inputBuf[cursor]=='.') cursor--;
-            break;
-        }
-    default:
-        {
-            inputBuf[cursor]=key;
-            cursor++;
-            if(inputBuf[cursor]=='.') cursor++;
-            if(cursor>3) cursor=3;
-        }
-    }
-    //writeAt(1,2,inputBuf);
-    float temp=parseTemp(inputBuf);
-    dtostrf(temp,3,1,inputBuf);
-    writeAt(1,2,inputBuf);
-    at(1+cursor,2);
-}
-
-void handlePinEditKey(char key) {
-    switch(key) {
-    case '*':
-        {
-            byte pin=(byte)atoi(inputBuf);
-            cursorOff();
-            if(pin!=herp.vivs[vivIndex].relay_pin) {
-                if(pin==0 || pin>2 && pin<10) {
-                    digitalWrite(herp.vivs[vivIndex].relay_pin,0);
-                    pinMode(herp.vivs[vivIndex].relay_pin,INPUT);
-                    herp.vivs[vivIndex].relay_pin=pin;
-                    pinMode(pin,OUTPUT);
-                    updateEeprom();
-                }
-            }
-
-            vivEditMenu();
-            return;
-        }
-    case '#':
-        {
-            cursor--;
-            if(cursor<0) cursor=0;
-            //if(inputBuf[cursor]=='.') cursor--;
-            break;
-        }
-    default:
-        {
-            inputBuf[cursor]=key;
-            cursor++;
-            //if(inputBuf[cursor]=='.') cursor++;
-            if(cursor>1) cursor=1;
-        }
-    }
-    //writeAt(1,2,inputBuf);
-    //float temp=parseTemp(inputBuf);
-    //dtostrf(temp,3,1,inputBuf);
-    writeAt(1,3,inputBuf);
-    at(1+cursor,3);
-}
-
-float parseTemp(char *buf) {
-    float temp=(buf[0]-'0')*10+(buf[1]-'0')+(((float)(buf[3]-'0'))/10);
-    return temp;
-}
-
-void vivHeader(int v) {
-    fmt2Digits(displayBuf,v+1);
-    displayBuf[2]=0;
-    writeAt_P(1,1,PSTR("#   :"));
-    writeAt(2,1,displayBuf);
-    strncpy(displayBuf,herp.vivs[v].name,8);
-    displayBuf[8]=0;
-    writeAt(6,1,displayBuf);
-}
-
-void vivEditMenu() {
-    menuState=viv_edit_menu;
-    cls();
-    vivHeader(vivIndex);
-    writeAt_P(16,1,PSTR("0 Name"));
-    writeAt_P(1,2,PSTR("1 Sensor"));
-    writeAt_P(1,3,PSTR("2 Low"));
-    writeAt_P(10,2,PSTR("3 Target"));
-    writeAt_P(10,3,PSTR("4 High"));
-    showBack();
-    writeAt_P(8,4,PSTR("#=Pin"));
-}
-
-void tempEntry(enum edit_temp_type type) {
-    menuState=set_temp;
-    temp_type=type;
-    cls();
-    writeAt_P(1,1,PSTR("Set Temp ( )"));
-    if(herp.flags & 1<<TEMP_FLAG) {
-        writeAt_P(11,1,PSTR("F"));
-    }
-    else {
-        writeAt_P(11,1,PSTR("C"));
-    }
-    showBack();
-    writeAt_P(8,4,PSTR("#=Left"));
-    memset(inputBuf,0,sizeof(inputBuf));
-    switch(temp_type) {
-    case edit_lo:
-        editingTemp=getLo(vivIndex);
-        break;
-    case edit_target:
-        editingTemp=getTarget(vivIndex);
-        break;
-    case edit_hi:
-        editingTemp=getHi(vivIndex);
-        break;
-    }
-    editingTemp=cToMaybeF(editingTemp);
-    dtostrf(editingTemp,3,1,inputBuf);
-    inputBuf[5]=0;
-    writeAt(1,2,inputBuf);
-    at(1,2);
-    cursorOn();
-    cursor=0;
-}
-
-void timeEntry() {
-    menuState=set_time;
-    cls();
-    writeAt_P(1,1,PSTR("Set Time (24 Hr)"));
-    showBack();
-    writeAt_P(8,4,PSTR("#=Left"));
-
-    fmtDateTime(inputBuf);
-    inputBuf[14]=0;
-    writeAt(1,2,inputBuf);
-    at(1,2);
-    cursorOn();
-    cursor=0;
-}
-
-#endif
-
-void setLo(int v,float lo) {
-    if(lo>getTarget(v)) lo=getTarget(v);
-    herp.vivs[v].temp.lo=(byte)((herp.vivs[v].temp.target-lo)*10);
-}
-
-void setHi(int v,float hi) {
-    if(hi<getTarget(v)) hi=getTarget(v);
-    herp.vivs[v].temp.hi=(byte)((hi-herp.vivs[v].temp.target)*10);
+void setHi(int v, float hi) {
+  if (hi < getTarget(v)) hi = getTarget(v);
+  herp.power[v].controller.sensor.temp.hi = (byte)((hi - herp.power[v].controller.sensor.temp.target) * 10);
 }
 
 float getLo(int v) {
-    return herp.vivs[v].temp.target-((float)herp.vivs[v].temp.lo)/10;
+  return herp.power[v].controller.sensor.temp.target - ((float)herp.power[v].controller.sensor.temp.lo) / 10;
 }
 
 float getHi(int v) {
-    return herp.vivs[v].temp.target+((float)herp.vivs[v].temp.hi)/10;
+  return herp.power[v].controller.sensor.temp.target + ((float)herp.power[v].controller.sensor.temp.hi) / 10;
 }
 
 float getTarget(int v) {
-    return herp.vivs[v].temp.target;
+  return herp.power[v].controller.sensor.temp.target;
 }
 
-void setTarget(int v,float target) {
-    herp.vivs[v].temp.target=target;
+void setTarget(int v, float target) {
+  herp.power[v].controller.sensor.temp.target = target;
 }
 
-int vivForSensor(int s) {
-    for(int i=0;i<herp.viv_count;i++) {
-        if(memcmp(sensors[s].addr,herp.vivs[i].sensor_addr,8)==0) {
-            return i;
+// Scan all the sensors and update any sockets for which the temperature is outside the "ON" zone
+void checkTemps(/*YunClient &client*/) {
+  // Scan bus for new sensors
+  scan();
+
+  // Get all the sensors to read their temperatures
+  // and store them in the scratchpad
+  sensors.requestTemperatures();
+
+  for (int i = 0; i < MAX_DS1820_SENSORS; i++) {
+    if (!(valid & (1 << i))) continue;
+    float cTemp = sensors.getTempC(addr[i]);
+    for (int j = 0; j < MAX_POWER_SKT; j++) {
+      if (herp.power[j].ctrl_type != CTRL_SENSOR) continue;
+      if (memcmp(herp.power[j].controller.sensor.addr, addr[i], sizeof(DeviceAddress))) continue;
+      // Found a socket bound to this sensor
+      if (cTemp < getLo(j)) {
+        digitalWrite(SKT_BASE + j, POWER_ON);
+      } else {
+        if (cTemp > getHi(j)) {
+          digitalWrite(SKT_BASE + j, POWER_OFF);
         }
+      }
     }
-    return -1;
+  }
+  sys_state.scanTime = now();
 }
-
-int sensorForViv(int v) {
-    for(int i=0;i<sensorCount;i++) {
-        if(memcmp(sensors[i].addr,herp.vivs[v].sensor_addr,8)==0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-#ifdef LOCAL_DISPLAY
-
-void displayViv(int v) {
-    vivHeader(v);
-
-    float lo=getLo(v);
-    at(1,3);
-    writeTemp(cToMaybeF(lo));
-
-    at(7,3);
-    writeTemp(cToMaybeF(herp.vivs[v].temp.target));
-
-    float hi=getHi(v);
-    at(13,3);
-    writeTemp(cToMaybeF(hi));
-
-    fmt2Digits(displayBuf,herp.vivs[v].relay_pin);
-    displayBuf[2]=0;
-    writeAt(18,3,displayBuf);
-
-    writeAt_P(1,2,PSTR("Low  Target High Pin"));
-}
-
-char *scrollbuf=0;
-
-void vivMenu() {
-    menuState=viv_menu;
-    cls();
-    displayViv(vivIndex);
-    scrollWindow.line=4;
-    scrollWindow.offset=1;
-    scrollWindow.length=20;
-    scrollWindow.start=0;
-    if(scrollbuf==0) scrollbuf=(char *)malloc(61);
-    int c=0;
-    memcpy_P(scrollbuf,PSTR("*=Back 1=Edit "),14);
-    c=14;
-    if(herp.viv_count<8) {
-        memcpy_P(scrollbuf+c,PSTR("2=Add "),6);
-        c+=6;
-    }
-    if(vivIndex!=0) {
-        memcpy_P(scrollbuf+c,PSTR("3=Delete "),9);
-        c+=9;
-    }
-    if(vivIndex<herp.viv_count-1) {
-        memcpy_P(scrollbuf+c,PSTR("4=Previous "),11);
-        c+=11;
-    }
-    if(vivIndex>0) {
-        memcpy_P(scrollbuf+c,PSTR("6=Next "),7);
-        c+=7;
-    }
-    scrollbuf[c]=0;
-    scrollWindow.text=scrollbuf;
-}
-
-inline void showBack() {
-    writeAt_P(1,4,PSTR("*=Back"));
-}
-
-void assignSensors() {
-    menuState=assign;
-    cls();
-    writeAt_P(1,1,PSTR("View Sensors"));
-    showBack();
-}
-
-void setupMenu() {
-    menuState=setup_menu;
-    cls();
-    writeAt_P(1,1,PSTR("Setup (Ver   )"));
-    displayBuf[2]=0;
-    fmt2Digits(displayBuf,herp.ver);
-    writeAt(12,1,displayBuf);
-    if(sdPresent) {
-        writeAt_P(16,1,PSTR("SD"));
-    }
-    if(didReset) {
-        writeAt_P(19,1,PSTR("RS"));
-    }
-    writeAt_P(1,2,PSTR("1 Sensors"));
-    // writeAt_P(1,3,PSTR("Free: "));
-    //  itoa(FreeRam(),displayBuf);
-    //  write(displayBuf);
-    writeAt_P(13,2,PSTR("3 C/F"));
-    if(herp.flags & (1<<TEMP_FLAG)) writeAt(19,2,"F");
-    else writeAt(19,2,"C");
-    showBack();
-}
-
-void noMenu() {
-    menuState=no_menu;
-    cls();
-    strncpy(displayBuf,herp.welcome,16);
-    displayBuf[16]=0;
-    writeAt(1,1,displayBuf);
-    //if(didReset) writeAt(19,1,"!");
-    writeAt_P(1,4,PSTR("*=Menu"));
-}
-
-void assignVivSensor() {
-    menuState=viv_sensor;
-    cls();
-    vivHeader(vivIndex);
-    int sensor=sensorForViv(vivIndex)+1;
-    writeAt_P(1,2,PSTR("Currently"));
-    if(sensor==0) {
-        writeAt_P(11,2,PSTR("None"));
-    }
-    else {
-        displayBuf[0]=sensor+'0';
-        displayBuf[1]=0;
-        writeAt(11,2,displayBuf);
-    }
-    writeAt_P(1,3,PSTR("Press Sensor Num"));
-    showBack();
-}
-
-#endif
-
-void updateEeprom() {
-#ifdef LOCAL_DISPLAY  
-    cls();
-    writeAt_P(6,2,PSTR("Saving..."));
-#endif
-    writeEeprom();
-}
-
-#ifdef LOCAL_DISPLAY
-void addViv() {
-    scrollWindow.line=0;
-    // Fixme: viv index naming on add after delete
-    int v=herp.viv_count;
-    memset(&herp.vivs[v],0,sizeof(struct viv));
-    strcpy_P(herp.vivs[v].name,PSTR("VIV #"));
-    herp.vivs[v].name[5]='0'+v+1;
-    herp.vivs[v].temp=herp.vivs[v-1].temp;
-    herp.viv_count++;
-    updateEeprom();
-    vivIndex=herp.viv_count-1;
-    vivMenu();
-}
-
-void deleteViv() {
-    scrollWindow.line=0;
-    int v=herp.viv_count;
-    if(vivIndex<v-1 && vivIndex>0) {
-        memcpy(&herp.vivs[vivIndex],&herp.vivs[vivIndex+1],sizeof(struct viv)*(v-vivIndex));
-    }
-    herp.viv_count--;
-    vivIndex=0;
-    updateEeprom();
-}
-
-void pinEdit() {
-    menuState=pin_edit;
-    cls();
-    vivHeader(vivIndex);
-    writeAt_P(1,2,PSTR("Edit Relay Pin"));
-    fmt2Digits(inputBuf,herp.vivs[vivIndex].relay_pin);
-    inputBuf[2]=0;
-    writeAt(1,3,inputBuf);
-    cursor=0;
-    showBack();
-}
-#endif
-#ifdef SERIAL
-void dumpSensorsToSerial() {
-    for(int i=0;i<sensorCount;i++) {
-        Serial.print(i);
-        Serial.print(',');
-        sensorIdToBuffer(i,displayBuf);
-        displayBuf[16]=0;
-        Serial.print(displayBuf);
-        Serial.print(',');
-        Serial.print(sensors[i].value);
-        Serial.print(',');
-        Serial.println(sensors[i].relay_on);
-    }
-    Serial.flush();
-}
-#endif
-
-#ifdef BRIDGE
-
-void dumpSensorsToBridge() {
-    Mailbox.writeMessage("S");
-    for(int i=0;i<sensorCount;i++) {
-        String sensor;
-        sensor+=(i);
-        sensor+=(',');
-        sensorIdToBuffer(i,displayBuf);
-        displayBuf[16]=0;
-        sensor+=displayBuf;
-        sensor+=',';
-        sensor+=sensors[i].value;
-        sensor+=',';
-        sensor+=sensors[i].relay_on;
-        Mailbox.writeMessage(sensor);
-    }
-    Mailbox.writeMessage("Z");
-}
-
-void handleMessage() {
-     String msg;
-     Mailbox.readMessage(msg);
-     char cmd=msg[0];
-     if(cmd=='S') dumpSensorsToBridge();
-#ifdef NOT_YET          
-        // Set time
-        if(cmd=='t') {
-            Serial.readBytes(inputBuf,14);
-            inputBuf[14]=0;
-            parseDateTime(inputBuf,true);
-        }
-        // Clock
-        if(cmd=='C') {
-            fmtDateTime(displayBuf,now());
-            displayBuf[14]=0;
-            Serial.println(displayBuf);
-        }
-#endif
-        // Set vivarium name
-        if(cmd=='N') {
-           int vivIndex=(msg[1]-'0')*10+(msg[2]-'0');
-           strncpy(herp.vivs[vivIndex].name,buf,8);
-        }
-        // REBOOT!
-        if(cmd=='R') {
-            wdt_enable (WDTO_2S);  // reset after two second, if no "pat the dog" received
-            while(true);
-        }
-}
-
-#endif
 
 void loop() {
-    time_t current=now();
+  // Get clients coming from server
+  YunClient client = server.accept();
 
-    if(current-lastRead>10) {
-        readSensors();
-#ifdef LOCAL_DISPLAY        
-        if(menuState==no_menu) sensorSpinner();
-#endif        
-        lastRead=current;
-    }
+  // There is a new client?
+  if (client) {
+    // Process request
+    process(client);
 
-#ifdef LOCAL_DISPLAY
-    key=readKey();
-    sameKey=key==lastKey;
-    lastKey=key;
-    if(key!=0 && !sameKey) {
-        lastKeyTime=current;
-        if(!backlight) {
-            cmd(LCD_CMD_BACKLIGHT_ON);
-            backlight=true;
-            writeAt_P(1,4,PSTR("*=Menu  "));
-            return;
-        }
+    // Close connection and free resources.
+    client.stop();
+  } else {
+    checkTemps(/*NULL*/);
+    // No pending requests. Wait for a while
+    Alarm.delay(1000); // Poll every 1000ms
+  }
 
-        switch(menuState) {
-        case set_temp:
-            editTemp(key);
-            break;
-        case no_menu:
-            {
-                if (key=='*') {
-                    mainMenu();
-                    break;
-                }
-                if (key=='1') {
-                    sensorCount=scanbus();
-                    break;
-                }
-                if (key=='2') {
-                    readSensors();
-                    lastRead=current;
-                    break;
-                }
-                if(key=='#') {
-                    silence=!silence;
-                }
-            }
-            break;
-        case main_menu:
-            {
-                if(key=='*') {
-                    noMenu();
-                    break;
-                }
-                if(key=='1') {
-                    timeEntry();
-                    break;
-                }
-                if(key=='2') {
-                    setupMenu();
-                    break;
-                }
-                if(key=='3') {
-                    vivMenu();
-                    break;
-                }
-                break;
-            }
-        case set_time:
-            editTime(key);
-            current=lastKeyTime;
-            break;
-        case setup_menu:
-            {
-                if(key=='*') {
-                    scrollWindow.line=0;
-                    noMenu();
-                    break;
-                };
-                if(key=='3') {
-                    // Toggle display c/f for main temperature display
-                    herp.flags ^= (1<<TEMP_FLAG);
-                    setupMenu();
-                    writeEeprom();
-                    break;
-                }
-                if(key=='1') {
-                    assignSensors();
-                    break;
-                }
-                break;
-            }
-        case viv_edit_menu:
-            {
-              switch(key) {
-                case '0': { editName(); break; }
-                case '1': {
-                    assignVivSensor();
-                    break;
-                }
-                case '*': {
-                    vivMenu();
-                    break;
-                }
-                case '2': {
-                    tempEntry(edit_lo);
-                    break;
-                }
-                case '3': {
-                    tempEntry(edit_target);
-                    break;
-                }
-                case '4': {
-                    tempEntry(edit_hi);
-                    break;
-                }
-                case '#': {
-                    pinEdit();
-                    break;
-                }
-              }
-                break;
-            }
-        case pin_edit:
-            handlePinEditKey(key);
-            break;
-        case viv_menu:
-            {
-                if(key=='*') {
-                    scrollWindow.line=0;
-                    noMenu();
-                    break;
-                };
-                if(key=='1') {
-                    scrollWindow.line=0;
-                    vivEditMenu();
-                    break;
-                }
-                if(key=='2' && herp.viv_count<8) {
-                    addViv();
-                    break;
-                }
-                if(key=='6' && vivIndex<herp.viv_count-1) {
-                    vivIndex++;
-                    vivMenu();
-                    break;
-                }
-                if(key=='4' && vivIndex>0) {
-                    vivIndex--;
-                    vivMenu();
-                    break;
-                }
-                if(key=='3' && herp.viv_count>1) {
-                    deleteViv();
-                    vivMenu();
-                    break;
-                }
-                break;
-            }
-        case edit_name:
-        {
-          handleNameKey(key); break;
-        }
-        case assign:
-            {
-                if(key=='*') {
-                    scrollWindow.line=0;
-                    setupMenu();
-                    break;
-                };
-                break;
-            }
-        case viv_sensor:
-            {
-                if(key=='*') {
-                    vivEditMenu();
-                    break;
-                }
-                if(key=='0') {
-                    memset(herp.vivs[vivIndex].sensor_addr,0,8);
-                    updateEeprom();
-                    assignVivSensor();
-                    break;
-                }
-                if(key>'0' && key<('0'+sensorCount+1)) {
-                    memcpy(herp.vivs[vivIndex].sensor_addr,sensors[key-'0'-1].addr,8);
-                    updateEeprom();
-                    assignVivSensor();
-                    break;
-                }
-                break;
-            }
-        default:
-            menuState=no_menu;
-            cls();
-            break;
-        }
-    }
-#endif
-
-#ifdef BRIDGE
-    if(Mailbox.messageAvailable()) {
-      handleMessage();
-    }
-#endif
-
-#ifdef LOCAL_DISPLAY
-    display();
-
-    if(menuState!=set_time && backlight && (current - lastKeyTime ) > 5*60) {
-        cmd(LCD_CMD_BACKLIGHT_OFF);
-        backlight=false;
-        writeAt_P(1,4,PSTR("*=Wakeup"));
-    }
-
-    // Change response time if backlight is on
-    if(!backlight) delay(500);
-    else delay(50);
-#else
-   delay(500);
-#endif
 
 }
 
-#ifdef SERIAL
-void serialEvent() {
-    while(Serial.available()) {
-        int cmd=Serial.read();
-        if(cmd=='S') dumpSensorsToSerial();
-#ifdef LOGGER        
-        // List files human readable
-        if(cmd=='L') Fat16::ls(LS_DATE | LS_SIZE);
-        // list files just names
-        if(cmd=='l') Fat16::ls();
-        // Dump file TODO: Add time threshold
-        if(cmd=='F') {
-            int fileIdx=Serial.read()-'0';
-            dumpFile(fileIdx);
-        }
-        // Truncate File
-        if(cmd=='T') {
-            int fileIdx=Serial.read()-'0';
-            truncateFile(fileIdx);
-        }
-#endif       
-        // Set time
-        if(cmd=='t') {
-            Serial.readBytes(inputBuf,14);
-            inputBuf[14]=0;
-            parseDateTime(inputBuf,true);
-        }
-        // Clock
-        if(cmd=='C') {
-            fmtDateTime(displayBuf,now());
-            displayBuf[14]=0;
-            Serial.println(displayBuf);
-        }
-        // change baud rate for serial port
-        if(cmd=='B') {
-            Serial.flush();
-            delay(2);
-            Serial.end();
-            Serial.begin(115200);
-        }
-        // REBOOT!
-        if(cmd=='R') {
-            wdt_enable (WDTO_2S);  // reset after two second, if no "pat the dog" received
-            while(true);
-        }
-    }
-#endif
+inline float cToF(float tempC) {
+  return DallasTemperature::toFahrenheit(tempC);
 }
+
+void fmt2DigitsR(char *buf, int num, int radix) {
+  char ibuf[3];
+  ibuf[2] = 0;
+  itoa(num, ibuf, radix);
+  if (ibuf[1] == 0) {
+    ibuf[0] = '0';
+    itoa(num, ibuf + 1, radix);
+  }
+  memcpy(buf, ibuf, 2);
+}
+
+void fmt2XDigits(char *buf, int num) {
+  fmt2DigitsR(buf, num, RADIX_HEX);
+}
+
+void fmt2Digits(char *buf, int num) {
+  fmt2DigitsR(buf, num, RADIX_DEC);
+}
+
+void sensorIdToBuffer(const int idx, char *buf) {
+  for (int i = 0; i < 8; i++) {
+    fmt2XDigits(buf, addr[idx][i]);
+    buf += 2;
+  }
+  buf[0] = 0;
+}
+
+void sensorIdPtrToBuffer(DeviceAddress addr, char *buf) {
+  for (int i = 0; i < 8; i++) {
+    fmt2XDigits(buf, addr[i]);
+    buf += 2;
+  }
+  buf[0] = 0;
+}
+
+// Return the full state of all the sensors, sockets and their bound sensors/timers (if any)
+inline void stateCommand(YunClient &client) {
+  getTempCommand(client);
+  client.println(F("SKT,ON,CTRL,SENS,LC,TC,HC,TI"));
+  char buf[17];
+  for (int i = 0; i < MAX_POWER_SKT; i++) {
+    client.print(i);
+    client.print(',');
+    client.print(digitalRead(SKT_BASE + i)); // This reports true logic. With the relays I use, 0 = ON, 1 = OFF
+    client.print(',');
+#ifdef USE_NAMES
+    strncpy(buf, herp.power[i].name, NAME_LENGTH);
+    buf[NAME_LENGTH] = 0;
+    client.print(buf);
+    client.print(',');
+#endif
+    client.print(herp.power[i].ctrl_type);
+    client.print(',');
+    sensorIdPtrToBuffer(herp.power[i].controller.sensor.addr, buf);
+    client.print(buf);
+    client.print(',');
+    if (herp.power[i].ctrl_type == CTRL_SENSOR) {
+      client.print(getLo(i));
+      client.print(',');
+      client.print(getTarget(i));
+      client.print(',');
+      client.print(getHi(i));
+    } else {
+      client.print(F("0.0,0.0,0.0"));
+    }
+    client.print(',');
+    client.print(herp.power[i].controller.timer_idx);
+    client.println();
+  }
+}
+
+// Get the IDs of all connected sensors and their temperature irrespective of whether they are controlling a socket
+inline void getTempCommand(YunClient &client) {
+  char buf[17];
+
+  digitalWrite(LED, LOW);
+
+  // Scan bus for new sensors
+  scan();
+
+  // TODO: Report removed sensors so we can detect failures
+
+  // Get all the sensors to read their temperatures
+  // and store them in the scratchpad
+  sensors.requestTemperatures();
+
+  client.println(F("SENS,C,F"));
+  for (int i = 0; i < MAX_DS1820_SENSORS; i++) {
+    if (!(valid & (1 << i))) continue;
+    sensorIdToBuffer(i, buf);
+    client.print(buf);
+    float cTemp = sensors.getTempC(addr[i]);
+    client.print(F(","));
+    client.print(cTemp);
+    client.print(F(","));
+    client.println(cToF(cTemp));
+  }
+  digitalWrite(LED, HIGH);
+}
+
+// Set  timer on/off times
+//Format : T/<idx>/h1:m1,h2:m2
+inline void timeCommand(YunClient &client) {
+  if (!checkSlash(client)) return;
+  int idx = client.parseInt();
+  if (!checkSlash(client)) return;
+  herp.timer[idx].on_hour = client.parseInt();
+  if (client.read() != ':') {
+    client.println(':');
+    return;
+  }
+  herp.timer[idx].on_min = client.parseInt();
+  if (client.read() != ',') {
+    client.println('C');
+    return;
+  }
+  herp.timer[idx].off_hour = client.parseInt();
+  if (client.read() != ':') {
+    client.println(':');
+    return;
+  }
+  herp.timer[idx].off_min = client.parseInt();
+  writeEeprom();
+  resetTimers();
+  send_ok(client);
+}
+
+inline void systemCommand(YunClient &client) {
+  // System Flag state
+  client.print(sys_state.didReset);
+  client.print(',');
+  client.print(sys_state.wroteHeader);
+  client.print(',');
+  client.print(sys_state.readHeader);
+  client.print(',');
+  client.print(sizeof(herp));
+  client.print(',');
+  client.print(sys_state.bootTime);
+  client.print(',');
+  client.println(sys_state.scanTime);
+  for (int i = 0; i < TIMER_MAX; i++) {
+    client.print(herp.timer[i].on_hour);
+    client.print(':');
+    client.print(herp.timer[i].on_min);
+    client.print(',');
+    client.print(herp.timer[i].off_hour);
+    client.print(':');
+    client.print(herp.timer[i].off_min);
+    client.println();
+  }
+}
+
+void process(YunClient &client) {
+  char command;
+  // read the command
+  command = client.read();
+
+  switch (command) {
+    case 'T': {
+        timeCommand(client);
+        return;
+      }
+    case 't': {
+        getTempCommand(client);
+        return;
+      }
+    case 'b': {
+        bindCommand(client);
+        return;
+      }
+    case 's': {
+        stateCommand(client);
+        return;
+      }
+
+#ifdef USE_NAMES
+    case 'n': {
+        nameCommand(client);
+        return;
+      }
+#endif
+
+    case 'S': {
+        systemCommand(client);
+        return;
+      }
+    default: {
+        client.println('?');
+        return;
+      }
+  }
+}
+
+
+
