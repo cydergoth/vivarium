@@ -28,8 +28,8 @@ In addition to an Arduino the following other components are required (URLs are 
 
 Miscellaneous hardware, resistors, sockets, plugs etc
 
-Note: When using low voltage (<110v) controlled 100v relays, always observe mains level precautions and ensure
-isolation between the low voltage and high voltage sides. Use a non-conductive filler compound, resin, or a non-condudting shield between the two voltage zones
+Note: When using low voltage (<110v) controlled 110v relays, always observe mains level precautions and ensure
+isolation between the low voltage and high voltage sides. Use a non-conductive filler compound, resin, or a non-conducting shield between the two voltage zones
 
 Required Libraries
 ------------------
