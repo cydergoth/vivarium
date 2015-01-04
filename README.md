@@ -6,6 +6,8 @@ Expandable Vivarium Controller (Arduino)
 This project is the driver software for an expandable Vivarium temperature controller using an Arduino as the 
 system master controller.
 
+*** NOTE: There is a varient of this project for Arduino Yun using a REST API on the "yun" branch ***
+
 Features
 --------
 
