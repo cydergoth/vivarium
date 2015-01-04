@@ -59,3 +59,9 @@ On the side of the case above it is an Ethernet jack and an RJ25 for the 1-wire 
 The relay board is visible on the left and the remaining space is where the 110v connector wires were fitted to the busbars
 
 ![Controller Image](controller.jpg)
+
+Image of Power and Sensor Connectors
+------------------------------------
+This image shows the 8 relay controlled sockets and the sensor connection jacks (5 RJ25 one RJ45 for Ethernet)
+
+![Connector Image](vivarium_connectors.jpg)
