@@ -11,6 +11,7 @@
 #include <Time.h>
 #include <TimeAlarms.h>
 #include <EEPROM.h>
+//#include <avr/wdt.h>
 
 // Settings for DallasTemperature library
 #define REQUIRESALARMS 0
@@ -67,6 +68,7 @@ int scan() {
   valid = 0;
   int i = 0;
   do {
+    //wdt_reset();
     if (!ds.search(addr[i])) {
       // No more sensors
       break;
@@ -230,8 +232,8 @@ inline void bindCommand(YunClient &client) {
 // Invoke 'date +%s' on the Linux side to get the seconds from epoch
 time_t timeSync() {
   Process date;
-  date.begin("date");
-  date.addParameter("+%s"); // Time in seconds from epoch
+  date.begin(F("date"));
+  date.addParameter(F("+%s")); // Time in seconds from epoch
   date.run();
   time_t time = 0;
   if (date.available() > 0) {
@@ -239,6 +241,7 @@ time_t timeSync() {
     String timeString = date.readString();
     time = (time_t)timeString.toInt(); // FIXME: Need a proper conversion function which can parse and return time_t
   }
+  date.close();
   return time;
 }
 
@@ -275,7 +278,9 @@ void resetTimers() {
 void setup() {
   pinMode(LED, OUTPUT);
   digitalWrite(LED, LOW);
-
+  
+  //wdt_enable(WDTO_2S); // Enable watchdog timer to reset MCU after 8 seconds if not reset
+  
   readEeprom();
 
   // Ensure all sockets start off powered down unless specifically set to CTRL_ALWAYS_ON
@@ -285,10 +290,13 @@ void setup() {
     pinMode(SKT_BASE + i, OUTPUT);
   }
 
+  //wdt_reset();
 
   // Bridge startup
   Bridge.begin();
 
+  //wdt_reset();
+  
   // Initialize clock
   setTime(timeSync());
   // Setup to sync time every 12 hours
@@ -296,6 +304,8 @@ void setup() {
   setSyncProvider(timeSync);
   sys_state.bootTime = now();
 
+  //wdt_reset();
+  
   // Ensure any configured timers are running
   resetTimers();
 
@@ -310,6 +320,11 @@ void setup() {
   digitalWrite(LED, HIGH);
   scan();
 
+  Process touch;
+  touch.begin(F("touch"));
+  touch.addParameter(F("/tmp/mcu_boot")); // Time in seconds from epoch
+  touch.run();
+  touch.close();
 }
 
 void setLo(int v, float lo) {
@@ -349,6 +364,7 @@ void checkTemps(/*YunClient &client*/) {
 
   for (int i = 0; i < MAX_DS1820_SENSORS; i++) {
     if (!(valid & (1 << i))) continue;
+    //wdt_reset();
     float cTemp = sensors.getTempC(addr[i]);
     for (int j = 0; j < MAX_POWER_SKT; j++) {
       if (herp.power[j].ctrl_type != CTRL_SENSOR) continue;
@@ -383,7 +399,7 @@ void loop() {
     Alarm.delay(1000); // Poll every 1000ms
   }
 
-
+//  wdt_reset(); // Pat the watchdog
 }
 
 inline float cToF(float tempC) {

@@ -25,7 +25,7 @@ float getHi(int v);
 #define CTRL_MAX CTRL_ALWAYS_ON
 
 // Version of the EEPROM layout. Change this if any EEPROM structs below change
-#define VER 3
+#define VER 4
 #define MAX_POWER_SKT 8
 
 // Configuration struct which must be serializable to EEPROM
