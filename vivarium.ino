@@ -62,6 +62,7 @@ inline void send_ok(YunClient &client) {
 
 // Scan the one wire bus and update the list of valid sensors
 // TODO: Report on missing sensors 
+// FIXME: Don't exceed max # of sensors we can handle!
 int scan() {
   ds.reset_search();
   memset(addr, 0, sizeof(addr));
@@ -316,7 +317,7 @@ void setup() {
 
   // Start the 1-Wire bus and configure the DS18B20 sensors
   sensors.begin();
-  sensors.setResolution(TEMP_12_BIT);
+  sensors.setResolution(TEMP_10_BIT);
   digitalWrite(LED, HIGH);
   scan();
 
@@ -443,6 +444,7 @@ void sensorIdPtrToBuffer(DeviceAddress addr, char *buf) {
 
 // Return the full state of all the sensors, sockets and their bound sensors/timers (if any)
 inline void stateCommand(YunClient &client) {
+  unsigned long start=millis();
   getTempCommand(client);
   client.println(F("SKT,ON,CTRL,SENS,LC,TC,HC,TI"));
   char buf[17];
@@ -475,6 +477,13 @@ inline void stateCommand(YunClient &client) {
     client.print(herp.power[i].controller.timer_idx);
     client.println();
   }
+#ifdef MORE_STATS  
+  client.print(F("S,"));
+  client.println(start);
+  sys_state.reportDuration=millis()-start;
+  client.print(F("D,"));
+  client.println(sys_state.reportDuration);
+#endif
 }
 
 // Get the IDs of all connected sensors and their temperature irrespective of whether they are controlling a socket
@@ -545,7 +554,13 @@ inline void systemCommand(YunClient &client) {
   client.print(',');
   client.print(sys_state.bootTime);
   client.print(',');
-  client.println(sys_state.scanTime);
+  client.print(sys_state.scanTime);
+#ifdef MORE_STATS
+  client.print(',');
+  client.println(sys_state.reportDuration);
+#else
+  client.println();
+#endif
   for (int i = 0; i < TIMER_MAX; i++) {
     client.print(herp.timer[i].on_hour);
     client.print(':');

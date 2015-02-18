@@ -66,12 +66,16 @@ extern struct herp_header herp;
 #define RADIX_HEX 16
 #define RADIX_DEC 10
 
+#define MORE_STATS 1
 struct system_flags {
   byte didReset: 1;
   byte readHeader: 1;
   byte wroteHeader: 1;
   time_t scanTime;
   time_t bootTime;
+#ifdef MORE_STATS
+  unsigned long reportDuration;
+#endif
 };
 
 extern system_flags sys_state;
