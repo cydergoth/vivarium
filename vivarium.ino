@@ -363,6 +363,15 @@ void checkTemps(/*YunClient &client*/) {
   // and store them in the scratchpad
   sensors.requestTemperatures();
 
+  if(valid==0) {
+    // Weird condition relating to no detected sensors. Fail safe and turn all heaters off
+    for(int j = 0; j < MAX_POWER_SKT; j++) {
+      if (herp.power[j].ctrl_type != CTRL_SENSOR) continue;
+      digitalWrite(SKT_BASE+j, POWER_OFF);
+    } 
+    return;
+  }
+  
   for (int i = 0; i < MAX_DS1820_SENSORS; i++) {
     if (!(valid & (1 << i))) continue;
     //wdt_reset();
