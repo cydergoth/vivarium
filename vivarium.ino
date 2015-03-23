@@ -31,9 +31,6 @@
 #define POWER_ON 0
 #define POWER_OFF 1
 
-#define HI_THRESHOLD 0.25f
-#define LO_THRESHOLD 0.25f
-
 // Listen on default port 5555, the webserver on the Yún
 // will forward there all the HTTP requests for us.
 YunServer server;
@@ -44,15 +41,25 @@ OneWire ds(ONE_WIRE_BUS);
 // High level support for the DS18B20 sensors
 DallasTemperature sensors(&ds);
 
-#define MAX_DS1820_SENSORS 8
+#define MAX_DS1820_SENSORS 12
 // Set of discovered sensors
 DeviceAddress addr[MAX_DS1820_SENSORS];
 unsigned short valid = 0; // Max of 16 sensors
 
+// Set of useful flags describing the state of the system
 system_flags sys_state;
 
 // Copy of the configuration loaded from eeprom on boot
 struct herp_header herp;
+
+#ifdef MORE_STATS
+// Function which is supposed to return the level of free ram in the Arduino ram space, the difference between top of head and bottom of stack
+int freeRam () {
+  extern int __heap_start, *__brkval; 
+  int v; 
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
+}
+#endif
 
 // Write a completion message to a REST client
 inline void send_ok(YunClient &client) {
@@ -64,9 +71,14 @@ inline void send_ok(YunClient &client) {
 // TODO: Report on missing sensors 
 // FIXME: Don't exceed max # of sensors we can handle!
 int scan() {
-  ds.reset_search();
   memset(addr, 0, sizeof(addr));
   valid = 0;
+  //digitalWrite(ONE_WIRE_BUS,LOW);
+  //if(digitalRead(ONE_WIRE_BUS)!=LOW) return 0; // Hung bus
+  //digitalWrite(ONE_WIRE_BUS,HIGH);
+  //if(digitalRead(ONE_WIRE_BUS)!=HIGH) return 0; // Hung bus
+  
+  ds.reset_search();
   int i = 0;
   do {
     //wdt_reset();
@@ -89,6 +101,7 @@ int scan() {
   if (!valid) {
     // No sensors found, turn off das blinkenlicht
     digitalWrite(LED, LOW);
+    return 0;
   }
   return i;
 }
@@ -170,7 +183,7 @@ inline void bindSensor(YunClient &client, int skt) {
 
 // Bind a sensor or timer to a socket. This is the master configuration command
 // Format: b/<skt>/0 - Always off
-//         b/<skt>/1/<sensor idx>/<target temp in C>,<lo offset>*10,<hi offset>*10 - Sensor controlled
+//         b/<skt>/1/<sensor idx>/<target temp in C>,<lo temp>,<hi temp> - Sensor controlled
 //         b/<skt>/2/<timer idx> - Timer Controller
 //         b/<skt>/3/[01] - Short manual override
 //         b/<skt>/4 - Always on
@@ -357,13 +370,7 @@ void setTarget(int v, float target) {
 // Scan all the sensors and update any sockets for which the temperature is outside the "ON" zone
 void checkTemps(/*YunClient &client*/) {
   // Scan bus for new sensors
-  scan();
-
-  // Get all the sensors to read their temperatures
-  // and store them in the scratchpad
-  sensors.requestTemperatures();
-
-  if(valid==0) {
+  if(!scan()) {
     // Weird condition relating to no detected sensors. Fail safe and turn all heaters off
     for(int j = 0; j < MAX_POWER_SKT; j++) {
       if (herp.power[j].ctrl_type != CTRL_SENSOR) continue;
@@ -371,6 +378,10 @@ void checkTemps(/*YunClient &client*/) {
     } 
     return;
   }
+
+ // Get all the sensors to read their temperatures
+  // and store them in the scratchpad
+  sensors.requestTemperatures();
   
   for (int i = 0; i < MAX_DS1820_SENSORS; i++) {
     if (!(valid & (1 << i))) continue;
@@ -492,6 +503,8 @@ inline void stateCommand(YunClient &client) {
   sys_state.reportDuration=millis()-start;
   client.print(F("D,"));
   client.println(sys_state.reportDuration);
+  client.print(F("R,"));
+  client.println(freeRam());
 #endif
 }
 
@@ -528,6 +541,7 @@ inline void getTempCommand(YunClient &client) {
 //Format : T/<idx>/h1:m1,h2:m2
 inline void timeCommand(YunClient &client) {
   if (!checkSlash(client)) return;
+  // FIXME: Range check timer index, either here or on the other side of the bridge
   int idx = client.parseInt();
   if (!checkSlash(client)) return;
   herp.timer[idx].on_hour = client.parseInt();
@@ -566,7 +580,7 @@ inline void systemCommand(YunClient &client) {
   client.print(sys_state.scanTime);
 #ifdef MORE_STATS
   client.print(',');
-  client.println(sys_state.reportDuration);
+  client.println(sys_state.reportDuration); // Duration of the last report
 #else
   client.println();
 #endif
